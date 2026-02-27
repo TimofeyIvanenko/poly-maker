@@ -106,17 +106,12 @@ def find_best_price_with_size(price_dict, min_size, reverse=False):
 
     return best_price, best_size, second_best_price, second_best_size, top_price
 
-def get_order_prices(best_bid, best_bid_size, top_bid,  best_ask, best_ask_size, top_ask, avgPrice, row):
+def get_order_prices(_best_bid, _best_bid_size, top_bid, _best_ask, _best_ask_size, top_ask, avgPrice, row):
 
-    bid_price = best_bid + row['tick_size']
-    ask_price = best_ask - row['tick_size']
-
-    if best_bid_size < row['min_size'] * 1.5:
-        bid_price = best_bid
-    
-    if best_ask_size < 250 * 1.5:
-        ask_price = best_ask
-    
+    tick_size = row['tick_size']
+    mid_price = (top_bid + top_ask) / 2
+    bid_price = max(top_bid, mid_price - tick_size)
+    ask_price = min(top_ask, mid_price + tick_size)
 
     if bid_price >= top_ask:
         bid_price = top_bid
@@ -163,8 +158,12 @@ def get_buy_sell_amount(position, bid_price, row, other_token_position=0):
     # If we haven't reached max_size on either side, continue building
     if position < max_size:
         # Continue quoting trade_size amounts until we reach max_size
-        remaining_to_max = max_size - position
-        buy_amount = min(trade_size, remaining_to_max)
+        # Account for total exposure across both sides to avoid over-buying
+        remaining_to_max = max_size - total_exposure
+        if remaining_to_max <= 0:
+            buy_amount = 0
+        else:
+            buy_amount = min(trade_size, remaining_to_max)
         
         # Only sell if we have substantial position (to allow for exit when needed)
         if position >= trade_size:
@@ -172,15 +171,9 @@ def get_buy_sell_amount(position, bid_price, row, other_token_position=0):
         else:
             sell_amount = 0
     else:
-        # We've reached max_size, implement progressive exit strategy
-        # Always offer to sell trade_size amount when at max_size
+        # We've reached max_size: only sell, no more buying
         sell_amount = min(position, trade_size)
-        
-        # Continue quoting to buy if total exposure warrants it
-        if total_exposure < max_size * 2:  # Allow some flexibility for market making
-            buy_amount = trade_size
-        else:
-            buy_amount = 0
+        buy_amount = 0
 
     # Ensure minimum order size compliance
     if buy_amount > 0.7 * row['min_size'] and buy_amount < row['min_size']:

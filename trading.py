@@ -11,7 +11,7 @@ import poly_data.CONSTANTS as CONSTANTS
 
 # Import utility functions for trading
 from poly_data.trading_utils import get_best_bid_ask_deets, get_order_prices, get_buy_sell_amount, round_down, round_up
-from poly_data.data_utils import get_position, get_order, set_position
+from poly_data.data_utils import get_position, get_order, set_position, set_order
 
 # Create directory for storing position risk information
 if not os.path.exists('positions/'):
@@ -38,16 +38,17 @@ def send_buy_order(order):
     # Cancel orders if price changed significantly or size needs major adjustment
     price_diff = abs(existing_buy_price - order['price']) if existing_buy_price > 0 else float('inf')
     size_diff = abs(existing_buy_size - order['size']) if existing_buy_size > 0 else float('inf')
-    
+
     should_cancel = (
-        price_diff > 0.005 or  # Cancel if price diff > 0.5 cents
+        price_diff >= 0.005 or  # Cancel if price diff >= 0.5 cents
         size_diff > order['size'] * 0.1 or  # Cancel if size diff > 10%
         existing_buy_size == 0  # Cancel if no existing buy order
     )
-    
+
     if should_cancel and (existing_buy_size > 0 or order['orders']['sell']['size'] > 0):
         print(f"Cancelling buy orders - price diff: {price_diff:.4f}, size diff: {size_diff:.1f}")
         client.cancel_all_asset(order['token'])
+        set_order(order['token'], 'sell', 0, 0)  # cancel_all_asset also cancels sell; reflect that in state
     elif not should_cancel:
         print(f"Keeping existing buy orders - minor changes: price diff: {price_diff:.4f}, size diff: {size_diff:.1f}")
         return  # Don't place new order if existing one is fine
@@ -62,19 +63,20 @@ def send_buy_order(order):
         trade = False
 
     if trade:
-        # Only place orders with prices between 0.1 and 0.9 to avoid extreme positions
-        if order['price'] >= 0.1 and order['price'] < 0.9:
+        # Only place orders with prices between 0.05 and 0.95 to avoid extreme positions
+        if order['price'] >= 0.05 and order['price'] < 0.95:
             print(f'Creating new order for {order["size"]} at {order["price"]}')
             print(order['token'], 'BUY', order['price'], order['size'])
             client.create_order(
-                order['token'], 
-                'BUY', 
-                order['price'], 
-                order['size'], 
+                order['token'],
+                'BUY',
+                order['price'],
+                order['size'],
                 True if order['neg_risk'] == 'TRUE' else False
             )
+            set_order(order['token'], 'buy', order['size'], order['price'])
         else:
-            print("Not creating buy order because its outside acceptable price range (0.1-0.9)")
+            print("Not creating buy order because its outside acceptable price range (0.05-0.95)")
     else:
         print(f'Not creating new order because order price of {order["price"]} is less than incentive start price of {incentive_start}. Mid price is {order["mid_price"]}')
 
@@ -99,28 +101,30 @@ def send_sell_order(order):
     # Cancel orders if price changed significantly or size needs major adjustment
     price_diff = abs(existing_sell_price - order['price']) if existing_sell_price > 0 else float('inf')
     size_diff = abs(existing_sell_size - order['size']) if existing_sell_size > 0 else float('inf')
-    
+
     should_cancel = (
-        price_diff > 0.005 or  # Cancel if price diff > 0.5 cents
+        price_diff >= 0.005 or  # Cancel if price diff >= 0.5 cents
         size_diff > order['size'] * 0.1 or  # Cancel if size diff > 10%
         existing_sell_size == 0  # Cancel if no existing sell order
     )
-    
+
     if should_cancel and (existing_sell_size > 0 or order['orders']['buy']['size'] > 0):
         print(f"Cancelling sell orders - price diff: {price_diff:.4f}, size diff: {size_diff:.1f}")
         client.cancel_all_asset(order['token'])
+        set_order(order['token'], 'buy', 0, 0)  # cancel_all_asset also cancels buy; reflect that in state
     elif not should_cancel:
         print(f"Keeping existing sell orders - minor changes: price diff: {price_diff:.4f}, size diff: {size_diff:.1f}")
         return  # Don't place new order if existing one is fine
 
     print(f'Creating new order for {order["size"]} at {order["price"]}')
     client.create_order(
-        order['token'], 
-        'SELL', 
-        order['price'], 
-        order['size'], 
+        order['token'],
+        'SELL',
+        order['price'],
+        order['size'],
         True if order['neg_risk'] == 'TRUE' else False
     )
+    set_order(order['token'], 'sell', order['size'], order['price'])
 
 # Dictionary to store locks for each market to prevent concurrent trading on the same market
 market_locks = {}
@@ -147,12 +151,18 @@ async def perform_trade(market):
         try:
             client = global_state.client
             # Get market details from the configuration
-            row = global_state.df[global_state.df['condition_id'] == market].iloc[0]      
+            market_df = global_state.df[global_state.df['condition_id'] == market]
+            if len(market_df) == 0:
+                return
+            row = market_df.iloc[0]
             # Determine decimal precision from tick size
             round_length = len(str(row['tick_size']).split(".")[1])
 
-            # Get trading parameters for this market type
-            params = global_state.params[row['param_type']]
+            # Get trading parameters for this market type, fallback to first available
+            param_type = str(row.get('param_type', '')).strip()
+            if not param_type or param_type == 'nan' or param_type not in global_state.params:
+                param_type = next(iter(global_state.params))
+            params = global_state.params[param_type]
             
             # Create a list with both outcomes for the market
             deets = [
@@ -199,7 +209,12 @@ async def perform_trade(market):
                 #if deet has None for one these values below, call it with min size of 20
                 if deets['best_bid'] is None or deets['best_ask'] is None or deets['best_bid_size'] is None or deets['best_ask_size'] is None:
                     deets = get_best_bid_ask_deets(market, detail['name'], 20, 0.1)
-                
+
+                # Skip if order book is still empty after retry
+                if deets['best_bid'] is None or deets['best_ask'] is None:
+                    print(f"Skipping {detail['name']} for {row['question']} - empty order book")
+                    continue
+
                 # Extract all order book details
                 best_bid = deets['best_bid']
                 best_bid_size = deets['best_bid_size']
@@ -215,12 +230,6 @@ async def perform_trade(market):
                 # Round prices to appropriate precision
                 best_bid = round(best_bid, round_length)
                 best_ask = round(best_ask, round_length)
-
-                # Calculate ratio of buy vs sell liquidity in the market
-                try:
-                    overall_ratio = (deets['bid_sum_within_n_percent']) / (deets['ask_sum_within_n_percent'])
-                except:
-                    overall_ratio = 0
 
                 try:
                     second_best_bid = round(second_best_bid, round_length)
@@ -295,9 +304,15 @@ async def perform_trade(market):
 
                     # Get fresh market data for risk assessment
                     n_deets = get_best_bid_ask_deets(market, detail['name'], 100, 0.1)
-                    
+                    if n_deets['best_bid'] is None or n_deets['best_ask'] is None:
+                        n_deets = get_best_bid_ask_deets(market, detail['name'], 20, 0.1)
+                    if n_deets['best_bid'] is None or n_deets['best_ask'] is None:
+                        print(f"Skipping sell for {detail['name']} - empty order book")
+                        continue
+
                     # Calculate current market price and spread
                     mid_price = round_up((n_deets['best_bid'] + n_deets['best_ask']) / 2, round_length)
+                    order['mid_price'] = mid_price
                     spread = round(n_deets['best_ask'] - n_deets['best_bid'], 2)
 
                     # Calculate current profit/loss on position
@@ -316,7 +331,7 @@ async def perform_trade(market):
                     except:
                         ratio = 0
 
-                    pos_to_sell = sell_amount  # Amount to sell in risk-off scenario
+                    pos_to_sell = position  # Sell full position on stop-loss, not just trade_size
 
                     # ------- STOP-LOSS LOGIC -------
                     # Trigger stop-loss if either:
@@ -340,7 +355,8 @@ async def perform_trade(market):
                         client.cancel_all_market(market)
 
                         # Save risk details to file
-                        open(fname, 'w').write(json.dumps(risk_details))
+                        with open(fname, 'w') as f:
+                            f.write(json.dumps(risk_details))
                         continue
 
                 # ------- BUY ORDER LOGIC -------
@@ -352,25 +368,23 @@ async def perform_trade(market):
                 # 2. Position is less than absolute cap (250)
                 # 3. Buy amount is above minimum size
                 if position < max_size and position < 250 and buy_amount > 0 and buy_amount >= row['min_size']:
-                    # Get reference price from market data
-                    sheet_value = row['best_bid']
-
-                    if detail['name'] == 'token2':
-                        sheet_value = 1 - row['best_ask']
-
-                    sheet_value = round(sheet_value, round_length)
+                    # Compare live mid to sheet mid to detect if market moved since last config update
+                    # For token2 (NO), sheet mid must be flipped: NO_mid = 1 - YES_mid
+                    sheet_mid_yes = round((row['best_bid'] + row['best_ask']) / 2, round_length)
+                    sheet_mid = round(1 - sheet_mid_yes, round_length) if detail['name'] == 'token2' else sheet_mid_yes
                     order['size'] = buy_amount
                     order['price'] = bid_price
 
-                    # Check if price is far from reference
-                    price_change = abs(order['price'] - sheet_value)
+                    # Check if live market has moved significantly from sheet reference
+                    price_change = abs(mid_price - sheet_mid)
 
                     send_buy = True
 
                     # ------- RISK-OFF PERIOD CHECK -------
                     # If we're in a risk-off period (after stop-loss), don't buy
                     if os.path.isfile(fname):
-                        risk_details = json.load(open(fname))
+                        with open(fname) as f:
+                            risk_details = json.load(f)
 
                         start_trading_at = pd.to_datetime(risk_details['sleep_till'])
                         current_time = pd.Timestamp.utcnow().tz_localize(None)
@@ -380,53 +394,32 @@ async def perform_trade(market):
                             send_buy = False
                             print(f"Not sending a buy order because recently risked off. "
                                  f"Risked off at {risk_details['time']}")
+                        else:
+                            os.remove(fname)  # risk-off expired, clean up file
 
                     # Only proceed if we're not in risk-off period
                     if send_buy:
                         # Don't buy if volatility is high or price is far from reference
                         if row['3_hour'] > params['volatility_threshold'] or price_change >= 0.05:
                             print(f'3 Hour Volatility of {row["3_hour"]} is greater than max volatility of '
-                                  f'{params["volatility_threshold"]} or price of {order["price"]} is outside '
-                                  f'0.05 of {sheet_value}. Cancelling all orders')
+                                  f'{params["volatility_threshold"]} or live mid {mid_price} is outside '
+                                  f'0.05 of sheet mid {sheet_mid}. Cancelling all orders')
                             client.cancel_all_asset(order['token'])
                         else:
-                            # Check for reverse position (holding opposite outcome)
-                            rev_token = global_state.REVERSE_TOKENS[str(token)]
-                            rev_pos = get_position(rev_token)
-
-                            # If we have significant opposing position, don't buy more
-                            if rev_pos['size'] > row['min_size']:
-                                print("Bypassing creation of new buy order because there is a reverse position")
-                                if orders['buy']['size'] > CONSTANTS.MIN_MERGE_SIZE:
-                                    print("Cancelling buy orders because there is a reverse position")
-                                    client.cancel_all_asset(order['token'])
-                                
-                                continue
-                            
-                            # Check market buy/sell volume ratio
-                            if overall_ratio < 0:
-                                send_buy = False
-                                print(f"Not sending a buy order because overall ratio is {overall_ratio}")
-                                client.cancel_all_asset(order['token'])
-                            else:
-                                # Place new buy order if any of these conditions are met:
-                                # 1. We can get a better price than current order
-                                if best_bid > orders['buy']['price']:
-                                    print(f"Sending Buy Order for {token} because better price. "
-                                          f"Orders look like this: {orders['buy']}. Best Bid: {best_bid}")
-                                    send_buy_order(order)
-                                # 2. Current position + orders is not enough to reach max_size
-                                elif position + orders['buy']['size'] < 0.95 * max_size:
-                                    print(f"Sending Buy Order for {token} because not enough position + size")
-                                    send_buy_order(order)
-                                # 3. Our current order is too large and needs to be resized
-                                elif orders['buy']['size'] > order['size'] * 1.01:
-                                    print(f"Resending buy orders because open orders are too large")
-                                    send_buy_order(order)
-                                # Commented out logic for cancelling orders when market conditions change
-                                # elif best_bid_size < orders['buy']['size'] * 0.98 and abs(best_bid - second_best_bid) > 0.03:
-                                #     print(f"Cancelling buy orders because best size is less than 90% of open orders and spread is too large")
-                                #     global_state.client.cancel_all_asset(order['token'])
+                            # Place new buy order if any of these conditions are met:
+                            # 1. We can get a better price than current order
+                            if best_bid > orders['buy']['price']:
+                                print(f"Sending Buy Order for {token} because better price. "
+                                      f"Orders look like this: {orders['buy']}. Best Bid: {best_bid}")
+                                send_buy_order(order)
+                            # 2. Current position + orders is not enough to reach max_size
+                            elif position + orders['buy']['size'] < 0.95 * max_size:
+                                print(f"Sending Buy Order for {token} because not enough position + size")
+                                send_buy_order(order)
+                            # 3. Our current order is too large and needs to be resized
+                            elif orders['buy']['size'] > order['size'] * 1.01:
+                                print(f"Resending buy orders because open orders are too large")
+                                send_buy_order(order)
                         
                 # ------- TAKE PROFIT / SELL ORDER MANAGEMENT -------            
                 elif sell_amount > 0:
@@ -438,15 +431,16 @@ async def perform_trade(market):
                     
                     tp_price = float(tp_price)
                     order_price = float(orders['sell']['price'])
-                    
-                    # Calculate % difference between current order and ideal price
-                    diff = abs(order_price - tp_price)/tp_price * 100
+                    new_price = float(order['price'])
+
+                    # Calculate % difference between current order and new intended price
+                    diff = abs(order_price - new_price) / new_price * 100 if new_price > 0 else float('inf')
 
                     # Update sell order if:
-                    # 1. Current order price is significantly different from target
+                    # 1. Current order price is significantly different from new intended price
                     if diff > 2:
-                        print(f"Sending Sell Order for {token} because better current order price of "
-                              f"{order_price} is deviant from the tp_price of {tp_price} and diff is {diff}")
+                        print(f"Sending Sell Order for {token} because existing price {order_price} "
+                              f"differs from new target price {new_price} by {diff:.1f}% (tp_price={tp_price})")
                         send_sell_order(order)
                     # 2. Current order size is too small for our position
                     elif orders['sell']['size'] < position * 0.97:

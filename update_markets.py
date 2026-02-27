@@ -74,6 +74,97 @@ def sort_df(df):
     
     return sorted_df
 
+REMOVE_REWARD_THRESHOLD = 0.5   # remove from Selected if reward drops below this
+ADD_REWARD_THRESHOLD = 1.0      # add to Selected only if reward is above this
+ADD_VOLATILITY_MAX = 20         # add to Selected only if volatility_sum < this
+ADD_MIN_SIZE_MAX = 50           # add to Selected only if min_size <= this (budget constraint)
+ADD_MAX_SPREAD = 0.15           # add to Selected only if current bid-ask spread <= this
+ADD_MIN_BID = 0.05              # add to Selected only if best_bid >= this (avoid empty orderbooks)
+ADD_MAX_ASK = 0.95              # add to Selected only if best_ask <= this (avoid empty orderbooks)
+ADD_MIN_VOLATILITY = 0.5        # add to Selected only if volatility_sum >= this (avoid zero-volume markets)
+TOP_N_MARKETS = 10              # max markets in Selected Markets
+DEFAULT_TRADE_SIZE = 50         # fallback if min_size < this
+DEFAULT_MAX_SIZE = 100          # 2 rounds of buying per market
+
+def auto_update_selected_markets(new_df, sel_df, spreadsheet):
+    """Auto-populate Selected Markets based on reward + volatility criteria.
+    - Removes markets whose reward dropped below REMOVE_REWARD_THRESHOLD
+    - Adds top candidates not already selected (sorted by composite score)
+    - Preserves existing trade_size/max_size for already-selected markets
+    """
+    wk_sel = spreadsheet.worksheet("Selected Markets")
+
+    # Candidates: low volatility + good reward + tradeable min_size + liquid orderbook + active market
+    candidates = new_df[
+        (new_df['volatility_sum'] >= ADD_MIN_VOLATILITY) &
+        (new_df['gm_reward_per_100'] >= ADD_REWARD_THRESHOLD) &
+        (new_df['min_size'] <= ADD_MIN_SIZE_MAX) &
+        (new_df['min_size'] > 0) &
+        (new_df['best_ask'] - new_df['best_bid'] <= ADD_MAX_SPREAD) &
+        (new_df['best_bid'] >= ADD_MIN_BID) &
+        (new_df['best_ask'] <= ADD_MAX_ASK)
+    ].copy()
+
+    try:
+        candidates = sort_df(candidates).head(TOP_N_MARKETS)
+    except Exception:
+        # sort_df can fail with too few rows (std=0); fall back to simple sort
+        candidates = candidates.sort_values('gm_reward_per_100', ascending=False).head(TOP_N_MARKETS)
+
+    def make_rows(df_subset):
+        """Build new_rows with trade_size = max(DEFAULT, min_size) and max_size = 2 * trade_size."""
+        rows = df_subset[['question']].copy()
+        min_sizes = df_subset['min_size'].values
+        trade_sizes = [max(DEFAULT_TRADE_SIZE, int(ms)) for ms in min_sizes]
+        rows['trade_size'] = trade_sizes
+        rows['max_size'] = [max(DEFAULT_MAX_SIZE, 2 * ts) for ts in trade_sizes]
+        rows['param_type'] = 'high'
+        return rows
+
+    if len(sel_df) == 0:
+        # Cold start: no existing selection, add top candidates with defaults
+        new_rows = make_rows(candidates)
+        update_sheet(new_rows, wk_sel)
+        print(f"Selected Markets (cold start): added {len(new_rows)} markets")
+        return new_rows
+
+    # Get current reward and liquidity for already-selected markets
+    existing_with_rewards = sel_df.merge(
+        new_df[['question', 'gm_reward_per_100', 'best_bid', 'best_ask', 'volatility_sum']], on='question', how='left'
+    )
+    # Keep markets with reward above threshold AND liquid orderbook
+    existing_with_rewards['_spread'] = existing_with_rewards['best_ask'] - existing_with_rewards['best_bid']
+    kept = existing_with_rewards[
+        (existing_with_rewards['gm_reward_per_100'].fillna(0) >= REMOVE_REWARD_THRESHOLD) &
+        (existing_with_rewards['_spread'].fillna(1) <= ADD_MAX_SPREAD) &
+        (existing_with_rewards['best_bid'].fillna(0) >= ADD_MIN_BID) &
+        (existing_with_rewards['best_ask'].fillna(1) <= ADD_MAX_ASK) &
+        (existing_with_rewards['volatility_sum'].fillna(0) >= ADD_MIN_VOLATILITY)
+    ]
+    kept = kept.drop(columns=['_spread', 'best_bid', 'best_ask', 'volatility_sum'])
+
+    # If more than TOP_N, trim to best by reward
+    if len(kept) > TOP_N_MARKETS:
+        kept = kept.sort_values('gm_reward_per_100', ascending=False).head(TOP_N_MARKETS)
+
+    kept = kept.drop(columns=['gm_reward_per_100'])
+    removed_count = len(sel_df) - len(kept)
+
+    # Add new candidates not already in kept, up to TOP_N total
+    existing_questions = set(kept['question'])
+    new_to_add = candidates[~candidates['question'].isin(existing_questions)]
+    slots_available = max(0, TOP_N_MARKETS - len(kept))
+    new_to_add = new_to_add.head(slots_available)
+
+    new_rows = make_rows(new_to_add)
+
+    combined = pd.concat([kept, new_rows], ignore_index=True).drop_duplicates('question')
+
+    update_sheet(combined, wk_sel)
+    print(f"Selected Markets updated: {len(kept)} kept, {len(new_rows)} added, {removed_count} removed")
+    return combined
+
+
 def fetch_and_process_data():
     global spreadsheet, client, wk_all, wk_vol, sel_df
     
@@ -89,6 +180,7 @@ def fetch_and_process_data():
 
     all_df = get_all_markets(client)
     print("Got all Markets")
+
     all_results = get_all_results(all_df, client)
     print("Got all Results")
     m_data, all_markets = get_markets(all_results, sel_df, maker_reward=0.75)
@@ -120,6 +212,9 @@ def fetch_and_process_data():
         update_sheet(new_df, wk_all)
         update_sheet(volatility_df, wk_vol)
         update_sheet(m_data, wk_full)
+        result = auto_update_selected_markets(new_df, sel_df, spreadsheet)
+        if result is not None:
+            sel_df = result
     else:
         print(f'{pd.to_datetime("now")}: Not updating sheet because of length {len(new_df)}.')
 
@@ -127,7 +222,7 @@ if __name__ == "__main__":
     while True:
         try:
             fetch_and_process_data()
-            time.sleep(60 * 60)  # Sleep for an hour
+            time.sleep(60 * 30)  # Sleep for 30 minutes
         except Exception as e:
             traceback.print_exc()
             print(str(e))

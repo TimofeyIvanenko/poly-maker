@@ -20,26 +20,33 @@ def update_positions(avgOnly=False):
         if not avgOnly:
             position['size'] = row['size']
         else:
-            
-            for col in [f"{asset}_sell", f"{asset}_buy"]:
-                #need to review this
-                if col not in global_state.performing or not isinstance(global_state.performing[col], set) or len(global_state.performing[col]) == 0:
-                    try:
-                        old_size = position['size']
-                    except:
-                        old_size = 0
+            any_pending = any(
+                col in global_state.performing
+                and isinstance(global_state.performing[col], set)
+                and len(global_state.performing[col]) > 0
+                for col in [f"{asset}_sell", f"{asset}_buy"]
+            )
 
-                    if asset in  global_state.last_trade_update:
-                        if time.time() - global_state.last_trade_update[asset] < 5:
-                            print(f"Skipping update for {asset} because last trade update was less than 5 seconds ago")
-                            continue
+            if any_pending:
+                pending_info = {col: list(global_state.performing[col]) for col in [f"{asset}_sell", f"{asset}_buy"] if col in global_state.performing and len(global_state.performing[col]) > 0}
+                print(f"ALERT: Skipping update for {asset} because there are trades pending: {pending_info}")
+            else:
+                try:
+                    old_size = position['size']
+                except:
+                    old_size = 0
 
+                if asset in global_state.last_trade_update:
+                    if time.time() - global_state.last_trade_update[asset] < 5:
+                        print(f"Skipping update for {asset} because last trade update was less than 5 seconds ago")
+                    else:
+                        if old_size != row['size']:
+                            print(f"No trades are pending. Updating position from {old_size} to {row['size']} and avgPrice to {row['avgPrice']} using API")
+                        position['size'] = row['size']
+                else:
                     if old_size != row['size']:
                         print(f"No trades are pending. Updating position from {old_size} to {row['size']} and avgPrice to {row['avgPrice']} using API")
-    
                     position['size'] = row['size']
-                else:
-                    print(f"ALERT: Skipping update for {asset} because there are trades pending for {col} looking like {global_state.performing[col]}")
     
         global_state.positions[asset] = position
 
@@ -134,14 +141,11 @@ def get_order(token):
         return {'buy': {'price': 0, 'size': 0}, 'sell': {'price': 0, 'size': 0}}
     
 def set_order(token, side, size, price):
-    curr = {}
-    curr = {side: {'price': 0, 'size': 0}}
-
-    curr[side]['size'] = float(size)
-    curr[side]['price'] = float(price)
-
-    global_state.orders[str(token)] = curr
-    print("Updated order, set to ", curr)
+    token = str(token)
+    if token not in global_state.orders:
+        global_state.orders[token] = {'buy': {'price': 0, 'size': 0}, 'sell': {'price': 0, 'size': 0}}
+    global_state.orders[token][side] = {'price': float(price), 'size': float(size)}
+    print("Updated order, set to ", global_state.orders[token])
 
     
 
@@ -154,9 +158,46 @@ def update_markets():
             received_df['multiplier'] = ''
         else:
             received_df['multiplier'] = received_df['multiplier'].fillna('')
-            
+
+        # Cancel orders and merge positions for markets removed from the sheet
+        if global_state.df is not None and global_state.client is not None:
+            old_conditions = set(global_state.df['condition_id'].astype(str))
+            new_conditions = set(received_df['condition_id'].astype(str))
+            removed = old_conditions - new_conditions
+            for condition_id in removed:
+                print(f"Market {condition_id} removed from sheet — cancelling all orders")
+                try:
+                    global_state.client.cancel_all_market(condition_id)
+                except Exception as e:
+                    print(f"Error cancelling orders for removed market {condition_id}: {e}")
+
+                # Auto-merge if both sides have position (risk-free profit)
+                try:
+                    mkt_row = global_state.df[global_state.df['condition_id'].astype(str) == condition_id]
+                    if len(mkt_row) == 0:
+                        continue
+                    mkt_row = mkt_row.iloc[0]
+                    pos_1 = global_state.client.get_position(mkt_row['token1'])[0]
+                    pos_2 = global_state.client.get_position(mkt_row['token2'])[0]
+                    amount_to_merge = min(pos_1, pos_2)
+                    scaled_amt = amount_to_merge / 10**6
+                    if scaled_amt > 20:
+                        print(f"Auto-merging {scaled_amt} tokens for removed market {condition_id}")
+                        global_state.client.merge_positions(amount_to_merge, condition_id, mkt_row['neg_risk'] == 'TRUE')
+                        set_position(mkt_row['token1'], 'SELL', scaled_amt, 0, 'merge')
+                        set_position(mkt_row['token2'], 'SELL', scaled_amt, 0, 'merge')
+                        remaining = get_position(mkt_row['token1'])['size'] + get_position(mkt_row['token2'])['size']
+                        if remaining > 0:
+                            print(f"WARNING: {condition_id} has {remaining} unmerged tokens after removal — handle manually")
+                    else:
+                        pos_str = f"YES={pos_1/1e6:.1f} NO={pos_2/1e6:.1f}"
+                        if pos_1 > 0 or pos_2 > 0:
+                            print(f"WARNING: {condition_id} removed with open position ({pos_str}) — handle manually")
+                except Exception as e:
+                    print(f"Error during merge for removed market {condition_id}: {e}")
+
         global_state.df, global_state.params = received_df.copy(), received_params
-    
+
 
     for _, row in global_state.df.iterrows():
         for col in ['token1', 'token2']:

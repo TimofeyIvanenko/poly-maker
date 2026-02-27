@@ -216,7 +216,7 @@ def process_single_row(row, client):
     return ret
 
 
-def get_all_results(all_df, client, max_workers=5):
+def get_all_results(all_df, client, max_workers=10):
     all_results = []
 
     def process_with_progress(args):
@@ -290,7 +290,7 @@ def add_volatility(row):
     new_dict = {**row_dict, **stats}
     return new_dict
 
-def add_volatility_to_df(df, max_workers=2):
+def add_volatility_to_df(df, max_workers=6):
     
     results = []
     df = df.reset_index(drop=True)
@@ -330,7 +330,8 @@ def get_markets(all_results, sel_df, maker_reward=1):
     s_df = new_df.copy()
     
 
-    making_markets = s_df[~new_df['question'].isin(sel_df['question'])]
+    sel_questions = sel_df['question'] if 'question' in sel_df.columns else pd.Series([], dtype=str)
+    making_markets = s_df[~new_df['question'].isin(sel_questions)]
     making_markets = making_markets.sort_values('gm_reward_per_100', ascending=False)
     making_markets = making_markets[making_markets['gm_reward_per_100'] >= maker_reward]
     all_markets = get_combined_markets(new_df, making_markets, sel_df)    

@@ -26,7 +26,8 @@ const envPath = existsSync(localEnvPath) ? localEnvPath : parentEnvPath;
 require('dotenv').config({ path: envPath })
 
 // Connect to Polygon network
-const provider = new ethers.providers.JsonRpcProvider("https://polygon-rpc.com");
+const rpcUrl = process.env.POLYGON_RPC_URL || "https://rpc.ankr.com/polygon";
+const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
 const privateKey = process.env.PK;
 const wallet = new ethers.Wallet(privateKey, provider);
 

@@ -70,7 +70,8 @@ class PolymarketClient:
         self.client.set_api_creds(creds=self.creds)
         
         # Initialize Web3 connection to Polygon
-        web3 = Web3(Web3.HTTPProvider("https://polygon-rpc.com"))
+        rpc_url = os.getenv("POLYGON_RPC_URL", "https://rpc.ankr.com/polygon")
+        web3 = Web3(Web3.HTTPProvider(rpc_url))
         web3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
         
         # Set up USDC contract for balance checks

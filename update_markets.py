@@ -67,11 +67,12 @@ ADD_MAX_SPREAD = 0.15           # add to Selected only if current bid-ask spread
 ADD_MIN_BID = 0.05              # add to Selected only if best_bid >= this (avoid empty orderbooks)
 ADD_MAX_ASK = 0.95              # add to Selected only if best_ask <= this (avoid empty orderbooks)
 ADD_MIN_VOLATILITY = 0.5        # add to Selected only if volatility_sum >= this (avoid zero-volume markets)
+ADD_MIN_DAILY_RATE = 10         # add to Selected only if rewards_daily_rate >= this (avoid low-pool markets)
 TOP_N_MARKETS = 10              # max markets in Selected Markets
 DEFAULT_TRADE_SIZE = 50         # fallback if min_size < this
 DEFAULT_MAX_SIZE = 100          # 2 rounds of buying per market
 
-def auto_update_selected_markets(new_df, sel_df, spreadsheet):
+def auto_update_selected_markets(new_df, volatility_df, sel_df, spreadsheet):
     """Auto-populate Selected Markets based on reward + volatility criteria.
     - Removes markets whose reward dropped below REMOVE_REWARD_THRESHOLD
     - Adds top candidates not already selected (sorted by composite score)
@@ -80,14 +81,15 @@ def auto_update_selected_markets(new_df, sel_df, spreadsheet):
     wk_sel = spreadsheet.worksheet("Selected Markets")
 
     # Candidates: low volatility + good reward + tradeable min_size + liquid orderbook + active market
-    candidates = new_df[
-        (new_df['volatility_sum'] >= ADD_MIN_VOLATILITY) &
-        (new_df['gm_reward_per_100'] >= ADD_REWARD_THRESHOLD) &
-        (new_df['min_size'] <= ADD_MIN_SIZE_MAX) &
-        (new_df['min_size'] > 0) &
-        (new_df['best_ask'] - new_df['best_bid'] <= ADD_MAX_SPREAD) &
-        (new_df['best_bid'] >= ADD_MIN_BID) &
-        (new_df['best_ask'] <= ADD_MAX_ASK)
+    candidates = volatility_df[
+        (volatility_df['volatility_sum'] >= ADD_MIN_VOLATILITY) &
+        (volatility_df['gm_reward_per_100'] >= ADD_REWARD_THRESHOLD) &
+        (volatility_df['rewards_daily_rate'] >= ADD_MIN_DAILY_RATE) &
+        (volatility_df['min_size'] <= ADD_MIN_SIZE_MAX) &
+        (volatility_df['min_size'] > 0) &
+        (volatility_df['best_ask'] - volatility_df['best_bid'] <= ADD_MAX_SPREAD) &
+        (volatility_df['best_bid'] >= ADD_MIN_BID) &
+        (volatility_df['best_ask'] <= ADD_MAX_ASK)
     ].copy()
 
     try:
@@ -115,18 +117,19 @@ def auto_update_selected_markets(new_df, sel_df, spreadsheet):
 
     # Get current reward and liquidity for already-selected markets
     existing_with_rewards = sel_df.merge(
-        new_df[['question', 'gm_reward_per_100', 'best_bid', 'best_ask', 'volatility_sum']], on='question', how='left'
+        new_df[['question', 'gm_reward_per_100', 'best_bid', 'best_ask', 'volatility_sum', 'rewards_daily_rate']], on='question', how='left'
     )
     # Keep markets with reward above threshold AND liquid orderbook
     existing_with_rewards['_spread'] = existing_with_rewards['best_ask'] - existing_with_rewards['best_bid']
     kept = existing_with_rewards[
         (existing_with_rewards['gm_reward_per_100'].fillna(0) >= REMOVE_REWARD_THRESHOLD) &
+        (existing_with_rewards['rewards_daily_rate'].fillna(0) >= ADD_MIN_DAILY_RATE) &
         (existing_with_rewards['_spread'].fillna(1) <= ADD_MAX_SPREAD) &
         (existing_with_rewards['best_bid'].fillna(0) >= ADD_MIN_BID) &
         (existing_with_rewards['best_ask'].fillna(1) <= ADD_MAX_ASK) &
         (existing_with_rewards['volatility_sum'].fillna(0) >= ADD_MIN_VOLATILITY)
     ]
-    kept = kept.drop(columns=['_spread', 'best_bid', 'best_ask', 'volatility_sum'])
+    kept = kept.drop(columns=['_spread', 'best_bid', 'best_ask', 'volatility_sum', 'rewards_daily_rate'])
 
     # If more than TOP_N, trim to best by reward
     if len(kept) > TOP_N_MARKETS:
@@ -197,7 +200,7 @@ def fetch_and_process_data():
         update_sheet(new_df, wk_all)
         update_sheet(volatility_df, wk_vol)
         update_sheet(m_data, wk_full)
-        result = auto_update_selected_markets(new_df, sel_df, spreadsheet)
+        result = auto_update_selected_markets(new_df, volatility_df, sel_df, spreadsheet)
         if result is not None:
             sel_df = result
     else:

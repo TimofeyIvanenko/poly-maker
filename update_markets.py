@@ -5,6 +5,7 @@ from data_updater.google_utils import get_spreadsheet
 from data_updater.find_markets import get_sel_df, get_all_markets, get_all_results, get_markets, add_volatility_to_df
 from gspread_dataframe import set_with_dataframe
 import traceback
+from poly_data.polymarket_client import PolymarketClient
 
 # Initialize global variables
 spreadsheet = get_spreadsheet()
@@ -153,6 +154,79 @@ def auto_update_selected_markets(new_df, volatility_df, sel_df, spreadsheet):
     return combined
 
 
+def cleanup_orphaned_positions(selected_condition_ids):
+    """Merge and sell positions in markets not in Selected Markets.
+    Skips markets that are already resolved (redeemable=True).
+    """
+    print("=== Cleanup: checking orphaned positions ===")
+    try:
+        pm_client = PolymarketClient()
+        pos_df = pm_client.get_all_positions()
+    except Exception as e:
+        print(f"Cleanup: failed to fetch positions: {e}")
+        return
+
+    if len(pos_df) == 0:
+        print("Cleanup: no positions found")
+        return
+
+    processed = set()
+    for _, row in pos_df.iterrows():
+        condition_id = str(row['conditionId'])
+
+        if condition_id in selected_condition_ids:
+            continue  # Actively managed by the bot
+        if condition_id in processed:
+            continue
+        processed.add(condition_id)
+
+        if row['redeemable']:
+            print(f"Cleanup: skip '{row['title'][:50]}' — resolved, will auto-settle")
+            continue
+
+        market_rows = pos_df[pos_df['conditionId'] == condition_id]
+        neg_risk = bool(market_rows.iloc[0]['negativeRisk'])
+        title = str(row['title'])[:50]
+
+        # Merge complementary Yes+No positions
+        if any(market_rows['mergeable']):
+            yes_rows = market_rows[market_rows['outcome'] == 'Yes']
+            no_rows = market_rows[market_rows['outcome'] == 'No']
+            if len(yes_rows) > 0 and len(no_rows) > 0:
+                yes_size = float(yes_rows.iloc[0]['size'])
+                no_size = float(no_rows.iloc[0]['size'])
+                amount_to_merge = min(yes_size, no_size)
+                if amount_to_merge >= 1:
+                    raw_amount = int(amount_to_merge * 1e6)
+                    print(f"Cleanup: merging {amount_to_merge:.1f} tokens for '{title}'")
+                    try:
+                        pm_client.merge_positions(raw_amount, condition_id, neg_risk)
+                    except Exception as e:
+                        print(f"Cleanup: merge error for '{title}': {e}")
+
+        # Sell remaining positions at best bid
+        for _, pos_row in market_rows.iterrows():
+            token = str(pos_row['asset'])
+            _, shares = pm_client.get_position(token)
+            if shares < 1:
+                continue
+            try:
+                bids_df, _ = pm_client.get_order_book(token)
+                if len(bids_df) == 0 or 'price' not in bids_df.columns:
+                    print(f"Cleanup: no bids for {pos_row['outcome']} in '{title}', skipping")
+                    continue
+                best_bid = float(bids_df['price'].max())
+                if best_bid < 0.05:
+                    print(f"Cleanup: bid {best_bid} too low for {pos_row['outcome']} in '{title}', skipping")
+                    continue
+                print(f"Cleanup: selling {shares} {pos_row['outcome']} @ {best_bid} for '{title}'")
+                pm_client.create_order(token, 'SELL', best_bid, shares, neg_risk)
+            except Exception as e:
+                print(f"Cleanup: sell error for {pos_row['outcome']} in '{title}': {e}")
+
+    print("=== Cleanup: done ===")
+
+
 def fetch_and_process_data():
     global spreadsheet, client, wk_all, wk_vol, sel_df
     
@@ -203,6 +277,12 @@ def fetch_and_process_data():
         result = auto_update_selected_markets(new_df, volatility_df, sel_df, spreadsheet)
         if result is not None:
             sel_df = result
+
+        # Cleanup orphaned positions (markets not in Selected)
+        selected_condition_ids = set(
+            new_df[new_df['question'].isin(sel_df['question'])]['condition_id'].astype(str)
+        )
+        cleanup_orphaned_positions(selected_condition_ids)
     else:
         print(f'{pd.to_datetime("now")}: Not updating sheet because of length {len(new_df)}.')
 

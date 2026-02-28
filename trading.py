@@ -293,12 +293,7 @@ async def perform_trade(market):
                 fname = 'positions/' + str(market) + '.json'
 
                 # ------- SELL ORDER LOGIC -------
-                if sell_amount > 0:
-                    # Skip if we have no average price (no real position)
-                    if avgPrice == 0:
-                        print("Avg Price is 0. Skipping")
-                        continue
-
+                if sell_amount > 0 and avgPrice != 0:
                     order['size'] = sell_amount
                     order['price'] = ask_price
 

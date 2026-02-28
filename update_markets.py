@@ -46,37 +46,22 @@ def sort_df(df):
     df['std_gm_reward_per_100'] = (df['gm_reward_per_100'] - mean_gm) / std_gm
     df['std_volatility_sum'] = (df['volatility_sum'] - mean_volatility) / std_volatility
     
-    # Define a custom scoring function for best_bid and best_ask
-    def proximity_score(value):
-        if 0.1 <= value <= 0.25:
-            return (0.25 - value) / 0.15
-        elif 0.75 <= value <= 0.9:
-            return (value - 0.75) / 0.15
-        else:
-            return 0
-    
-    df['bid_score'] = df['best_bid'].apply(proximity_score)
-    df['ask_score'] = df['best_ask'].apply(proximity_score)
-    
-    # Create a composite score (higher is better for rewards, lower is better for volatility, with proximity scores)
+    # Create a composite score (higher is better for rewards, lower is better for volatility)
     df['composite_score'] = (
-        df['std_gm_reward_per_100'] - 
-        df['std_volatility_sum'] + 
-        df['bid_score'] + 
-        df['ask_score']
+        df['std_gm_reward_per_100'] -
+        df['std_volatility_sum']
     )
-    
+
     # Sort by the composite score in descending order
     sorted_df = df.sort_values(by='composite_score', ascending=False)
-    
+
     # Drop the intermediate columns used for calculation
-    sorted_df = sorted_df.drop(columns=['std_gm_reward_per_100', 'std_volatility_sum', 'bid_score', 'ask_score', 'composite_score'])
+    sorted_df = sorted_df.drop(columns=['std_gm_reward_per_100', 'std_volatility_sum', 'composite_score'])
     
     return sorted_df
 
 REMOVE_REWARD_THRESHOLD = 0.5   # remove from Selected if reward drops below this
 ADD_REWARD_THRESHOLD = 1.0      # add to Selected only if reward is above this
-ADD_VOLATILITY_MAX = 20         # add to Selected only if volatility_sum < this
 ADD_MIN_SIZE_MAX = 50           # add to Selected only if min_size <= this (budget constraint)
 ADD_MAX_SPREAD = 0.15           # add to Selected only if current bid-ask spread <= this
 ADD_MIN_BID = 0.05              # add to Selected only if best_bid >= this (avoid empty orderbooks)

@@ -186,13 +186,28 @@ def update_markets():
                         global_state.client.merge_positions(amount_to_merge, condition_id, mkt_row['neg_risk'] == 'TRUE')
                         set_position(mkt_row['token1'], 'SELL', scaled_amt, 0, 'merge')
                         set_position(mkt_row['token2'], 'SELL', scaled_amt, 0, 'merge')
-                        remaining = get_position(mkt_row['token1'])['size'] + get_position(mkt_row['token2'])['size']
-                        if remaining > 0:
-                            print(f"WARNING: {condition_id} has {remaining} unmerged tokens after removal — handle manually")
-                    else:
-                        pos_str = f"YES={pos_1/1e6:.1f} NO={pos_2/1e6:.1f}"
-                        if pos_1 > 0 or pos_2 > 0:
-                            print(f"WARNING: {condition_id} removed with open position ({pos_str}) — handle manually")
+
+                    # Place sell orders for any remaining unmerged positions
+                    neg_risk = mkt_row['neg_risk'] == 'TRUE'
+                    for token_col in ['token1', 'token2']:
+                        token_str = str(mkt_row[token_col])
+                        remaining_pos = get_position(token_str)['size']
+                        if remaining_pos >= 1:
+                            try:
+                                book = global_state.client.get_order_book(token_str)
+                                bids = sorted(
+                                    [(float(b.price), float(b.size)) for b in book.bids],
+                                    reverse=True
+                                )
+                                best_bid = bids[0][0] if bids else None
+                                if best_bid and best_bid >= 0.02:
+                                    print(f"Auto-selling {remaining_pos} {token_col} at {best_bid} for removed market {condition_id}")
+                                    global_state.client.create_order(token_str, 'SELL', best_bid, remaining_pos, neg_risk)
+                                    set_order(token_str, 'sell', remaining_pos, best_bid)
+                                else:
+                                    print(f"WARNING: {token_col} for {condition_id} has {remaining_pos} shares but best_bid={best_bid} — skipping auto-sell")
+                            except Exception as e:
+                                print(f"Error auto-selling {token_col} for removed market {condition_id}: {e}")
                 except Exception as e:
                     print(f"Error during merge for removed market {condition_id}: {e}")
 

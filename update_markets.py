@@ -67,7 +67,7 @@ ADD_MAX_SPREAD = 0.15           # add to Selected only if current bid-ask spread
 ADD_MIN_BID = 0.05              # add to Selected only if best_bid >= this (avoid empty orderbooks)
 ADD_MAX_ASK = 0.95              # add to Selected only if best_ask <= this (avoid empty orderbooks)
 ADD_MIN_VOLATILITY = 0.5        # add to Selected only if volatility_sum >= this (avoid zero-volume markets)
-ADD_MIN_DAILY_RATE = 10         # add to Selected only if rewards_daily_rate >= this (avoid low-pool markets)
+ADD_MIN_DAILY_RATE = 3          # add to Selected only if rewards_daily_rate >= this (avoid low-pool markets)
 TOP_N_MARKETS = 10              # max markets in Selected Markets
 DEFAULT_TRADE_SIZE = 50         # fallback if min_size < this
 DEFAULT_MAX_SIZE = 100          # 2 rounds of buying per market
